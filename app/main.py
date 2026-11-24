@@ -7,6 +7,9 @@
   GET  /shifts/{shift}/diagnoses/latest  查询该班最新诊断
   GET  /shifts/{shift}/readings        查询该班当前登记与生效的复测区间
   GET  /shifts                         列出已有登记的班次
+  POST /accounts/{account}/reconciliations  多班交接两箱存量核算并保存
+  GET  /accounts/{account}/reconciliations  按账号查询历次核算结果
+  GET  /accounts/{account}/reconciliations/latest  查询该账号在用核算结果
 """
 from __future__ import annotations
 
@@ -15,7 +18,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from . import db
-from .schemas import ReadingsIn, RemeasureBatch
+from .reconcile import (FlowSegment, ReconciliationInfeasible, ShiftSnapshot,
+                        reconcile)
+from .schemas import ReadingsIn, ReconciliationIn, RemeasureBatch
 from .solver import Segment, SolverError, diagnose
 
 
@@ -27,12 +32,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷却水站班次水量平衡诊断",
-    version="1.0.0",
+    version="1.1.0",
     description="登记每班至多 20 个管段的起止节点、过水量上限与水表读数区间；"
                 "除进出水口外各节点进出水量相等。账平则给出可行流量；"
                 "账不平则列出“仅忽略该表原读数即可账平”的水表及其管段可行水量上下界；"
                 "支持补登人工复测区间——复测值取代该表原读数，"
-                "与过水量上限一样始终有效。",
+                "与过水量上限一样始终有效。另提供多班交接的两只水箱存量核算："
+                "按交接顺序串起 2~6 个诊断快照，求各时点两箱各自及合计的整段可达上下界，"
+                "按账号保存供查询。",
     lifespan=lifespan,
 )
 
@@ -199,6 +206,129 @@ def get_readings(shift: str):
             "remeasures": db.remeasurements_for_shift(shift),
             "effective_remeasures": {k: {"rlo": lo, "rhi": hi} for k, (lo, hi)
                                      in _effective_remeasures(shift).items()}}
+
+
+# ---------------- 多班两箱存量核算 ----------------
+
+def _load_snapshot(diagnosis_id: int) -> ShiftSnapshot:
+    """按诊断号取出留档快照：端口、各管段过水量上限与生效读数。"""
+    snap = db.diagnosis_snapshot(diagnosis_id)
+    if snap is None:
+        raise HTTPException(status_code=404,
+                            detail=f"诊断号 {diagnosis_id} 不存在")
+    inputs = snap["inputs"]
+    remeasures = inputs.get("remeasures") or {}
+    segments = []
+    for s in inputs["segments"]:
+        if s["key"] in remeasures:
+            lo = remeasures[s["key"]]["rlo"]   # 留档复测交集取代原读数
+            hi = remeasures[s["key"]]["rhi"]
+        else:
+            lo = s["meter_lo"]                 # 没复测就用原读数
+            hi = s["meter_hi"]
+        lo = max(0, lo)
+        hi = min(hi, s["capacity"])            # 过水量上限始终有效
+        segments.append(FlowSegment(key=s["key"], src=s["from_node"],
+                                    dst=s["to_node"], lo=lo, hi=hi))
+    return ShiftSnapshot(diagnosis_id=diagnosis_id, shift=snap["shift"],
+                         ports=frozenset(inputs.get("ports") or []),
+                         segments=tuple(segments))
+
+
+def _account_ok(account: str) -> str:
+    if not account or len(account) > 50:
+        raise HTTPException(status_code=422,
+                            detail="账号须为 1~50 字符")
+    return account
+
+
+@app.post("/accounts/{account}/reconciliations", status_code=201,
+          summary="多班交接两箱存量核算并保存")
+def post_reconciliation(account: str, body: ReconciliationIn):
+    """按交接顺序串起 2~6 个不同班次的诊断快照，求两只水箱在各时点
+    （含全段首尾及可选的实测时点）各自与合计的整段可达上下界。
+
+    水量为整数升；各管段沿用快照的过水量上限、留档复测交集（没复测用
+    原读数）与普通节点守恒；每班每箱期末减期初等于该口净流入，相邻班
+    共用交接存量，所有时点存量在零到容量之间。两箱须列在各班快照的
+    进出水口。可按账号换诊断号整段重提；无解、写入失败、或核算期间
+    同账号已有另一份结果入库时，本次退回并保留在用结果。
+    """
+    _account_ok(account)
+    snapshots = [_load_snapshot(i) for i in body.diagnosis_ids]
+
+    shifts = [s.shift for s in snapshots]
+    if len(set(shifts)) != len(shifts):
+        raise HTTPException(status_code=422,
+                            detail="诊断号须来自不同班次")
+
+    tanks = [(t.port, t.capacity) for t in body.tanks]
+    for snap in snapshots:
+        missing = [name for name, _ in tanks if name not in snap.ports]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"水箱口 {missing} 未列在班次 {snap.shift} "
+                       f"（诊断号 {snap.diagnosis_id}）的进出水口中")
+
+    n_shifts = len(snapshots)
+    storage_limits: dict[tuple[int, str], tuple[int, int]] = {}
+    for s in body.storage:
+        if s.time_index > n_shifts:
+            raise HTTPException(
+                status_code=422,
+                detail=f"实测存量时点 {s.time_index} 超出整段范围 "
+                       f"0~{n_shifts}")
+        storage_limits[(s.time_index, s.tank)] = (s.lo, s.hi)
+
+    # 先读账号版本，再求解；落库时核对版本以发现并发入库
+    expected_version = db.reconciliation_account_version(account)
+    try:
+        result = reconcile(snapshots, tanks, storage_limits)
+    except ReconciliationInfeasible as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"整段约束无解，已保留在用结果：{exc}")
+    except SolverError as exc:
+        raise HTTPException(status_code=500,
+                            detail=f"核算计算失败，已保留在用结果：{exc}")
+
+    request = {"diagnosis_ids": body.diagnosis_ids,
+               "tanks": [t.model_dump() for t in body.tanks],
+               "storage": [s.model_dump() for s in body.storage]}
+    try:
+        recon_id = db.save_reconciliation(
+            account, body.diagnosis_ids, request, result, expected_version)
+    except db.ReconciliationConflict as exc:
+        raise HTTPException(status_code=409,
+                            detail=f"{exc}；已保留在用结果")
+    except Exception as exc:  # 落库失败：事务回滚，旧结果不变
+        raise HTTPException(status_code=500,
+                            detail=f"保存失败，已保留在用结果：{exc}")
+
+    return {"reconciliation_id": recon_id, "account": account,
+            "diagnosis_ids": body.diagnosis_ids, "result": result}
+
+
+@app.get("/accounts/{account}/reconciliations",
+         summary="按账号查询历次核算结果")
+def get_reconciliations(account: str):
+    _account_ok(account)
+    rows = db.reconciliations_for_account(account)
+    if not rows:
+        raise HTTPException(status_code=404,
+                            detail=f"账号 {account} 没有任何核算记录")
+    return {"account": account, "reconciliations": rows}
+
+
+@app.get("/accounts/{account}/reconciliations/latest",
+         summary="查询该账号在用核算结果")
+def get_latest_reconciliation(account: str):
+    _account_ok(account)
+    row = db.latest_reconciliation(account)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"账号 {account} 没有任何核算记录")
+    return row
 
 
 @app.get("/health", include_in_schema=False)

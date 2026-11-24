@@ -140,6 +140,108 @@ eff = (r9.get("effective_remeasures") or {}).get("S3")
 check("一班生效复测区间可查", s9 == 200 and eff == {"rlo": 150, "rhi": 150},
       json.dumps(eff))
 
+# ---------------- 多班两箱存量核算 ----------------
+# 场景八：两班（可扩到三班）共用同一进水口，TA/TB 为水箱口
+PORTS = ["IN", "OUT", "TA", "TB"]
+SEGS = [
+    {"key": "F1", "from_node": "IN", "to_node": "J",
+     "capacity": 100, "meter_lo": 0, "meter_hi": 10},
+    {"key": "F2", "from_node": "J", "to_node": "TA",
+     "capacity": 100, "meter_lo": 0, "meter_hi": 10},
+    {"key": "F3", "from_node": "J", "to_node": "TB",
+     "capacity": 100, "meter_lo": 0, "meter_hi": 10},
+    {"key": "F4", "from_node": "TA", "to_node": "OUT",
+     "capacity": 100, "meter_lo": 0, "meter_hi": 10},
+    {"key": "F5", "from_node": "TB", "to_node": "OUT",
+     "capacity": 100, "meter_lo": 0, "meter_hi": 10},
+]
+diag_ids = []
+for name in ("交接一班", "交接二班", "交接三班"):
+    s, r = call("POST", f"/shifts/{name}/readings",
+                {"ports": PORTS, "segments": SEGS})
+    check(f"{name}登记账平", s == 201 and r.get("balanced") is True,
+          f"{s} {r.get('message')}")
+    diag_ids.append(r["diagnosis_id"])
+
+TANKS = [{"port": "TA", "capacity": 10}, {"port": "TB", "capacity": 10}]
+s8, r8 = call("POST", "/accounts/核算员甲/reconciliations",
+              {"diagnosis_ids": diag_ids, "tanks": TANKS})
+check("核算返回 201 并带核算号", s8 == 201 and r8.get("reconciliation_id"),
+      f"got {s8}: {r8.get('detail')}")
+tp = {p["time_index"]: p["bounds"] for p in r8.get("result", {}).get("time_points", [])}
+check("核算给出 n+1 个时点", set(tp) == {0, 1, 2, 3}, json.dumps(sorted(tp)))
+check("无实测时各时点两箱可达 [0,10]、合计 [0,20]",
+      all(tp[t]["TA"] == {"min": 0, "max": 10}
+          and tp[t]["TB"] == {"min": 0, "max": 10}
+          and tp[t]["total"] == {"min": 0, "max": 20} for t in tp),
+      json.dumps(tp))
+check("核算结果记录了所用诊断号",
+      r8.get("diagnosis_ids") == diag_ids, json.dumps(r8.get("diagnosis_ids")))
+
+# 场景九：全段首尾实测存量 -> 两端锁定；中间时点仍可达
+s9, r9 = call("POST", "/accounts/核算员乙/reconciliations", {
+    "diagnosis_ids": diag_ids[:2], "tanks": TANKS,
+    "storage": [{"time_index": 0, "tank": "TA", "lo": 10, "hi": 10},
+                {"time_index": 0, "tank": "TB", "lo": 0, "hi": 0},
+                {"time_index": 2, "tank": "TA", "lo": 0, "hi": 0},
+                {"time_index": 2, "tank": "TB", "lo": 10, "hi": 10}]})
+tp9 = {p["time_index"]: p["bounds"] for p in r9.get("result", {}).get("time_points", [])}
+check("首尾实测锁定两箱存量",
+      s9 == 201 and tp9.get(0, {}).get("TA") == {"min": 10, "max": 10}
+      and tp9.get(2, {}).get("TB") == {"min": 10, "max": 10},
+      json.dumps(tp9))
+check("实测时点回显所填区间",
+      r9.get("result", {}).get("time_points", [{}])[0].get("measured", {}).get("TA")
+      == {"lo": 10, "hi": 10})
+
+# 场景十：整段无解 -> 422，且该账号没有入库
+# 共用进水 F1<=10，两箱一班的合计净流入最多 10；要求首班从 0 升到 20 无解
+s10, r10 = call("POST", "/accounts/核算员丙/reconciliations", {
+    "diagnosis_ids": diag_ids[:2], "tanks": TANKS,
+    "storage": [{"time_index": 0, "tank": "TA", "lo": 0, "hi": 0},
+                {"time_index": 0, "tank": "TB", "lo": 0, "hi": 0},
+                {"time_index": 1, "tank": "TA", "lo": 10, "hi": 10},
+                {"time_index": 1, "tank": "TB", "lo": 10, "hi": 10}]})
+check("整段无解返回 422", s10 == 422, f"got {s10}: {r10.get('detail')}")
+s10b, _ = call("GET", "/accounts/核算员丙/reconciliations")
+check("无解时该账号无入库记录", s10b == 404, f"got {s10b}")
+
+# 场景十一：水箱口不在某班快照的进出水口 -> 422
+s11, r11 = call("POST", "/accounts/核算员丁/reconciliations", {
+    "diagnosis_ids": diag_ids[:2],
+    "tanks": [{"port": "TA", "capacity": 10}, {"port": "ZZ不存在的口", "capacity": 10}]})
+check("水箱口未列入快照进水口返回 422", s11 == 422,
+      f"got {s11}: {r11.get('detail')}")
+
+# 场景十二：换诊断号整段重提，按账号可查历史
+s12, r12 = call("POST", "/accounts/核算员甲/reconciliations", {
+    "diagnosis_ids": diag_ids[1:], "tanks": TANKS,
+    "storage": [{"time_index": 0, "tank": "TB", "lo": 3, "hi": 3}]})
+check("同账号换诊断号重提成功", s12 == 201, f"got {s12}: {r12.get('detail')}")
+s12b, r12b = call("GET", "/accounts/核算员甲/reconciliations")
+check("账号历次核算可查（2 次）",
+      s12b == 200 and len(r12b.get("reconciliations", [])) == 2,
+      f"count={len(r12b.get('reconciliations', []))}")
+s12c, r12c = call("GET", "/accounts/核算员甲/reconciliations/latest")
+check("最新核算为换号重提那次",
+      s12c == 200 and r12c.get("diagnosis_ids") == diag_ids[1:],
+      json.dumps(r12c.get("diagnosis_ids")))
+
+# 场景十三：入参校验
+s13, _ = call("POST", "/accounts/核算员戊/reconciliations",
+              {"diagnosis_ids": [diag_ids[0]], "tanks": TANKS})
+check("少于 2 个诊断号返回 422", s13 == 422, f"got {s13}")
+s13b, _ = call("POST", "/accounts/核算员戊/reconciliations",
+               {"diagnosis_ids": diag_ids * 3, "tanks": TANKS})
+check("多于 6 个诊断号返回 422", s13b == 422, f"got {s13b}")
+s13c, _ = call("POST", "/accounts/核算员戊/reconciliations",
+               {"diagnosis_ids": [diag_ids[0], diag_ids[0]], "tanks": TANKS})
+check("诊断号重复返回 422", s13c == 422, f"got {s13c}")
+s13d, _ = call("POST", "/accounts/核算员戊/reconciliations",
+               {"diagnosis_ids": diag_ids[:2],
+                "tanks": [{"port": "TA", "capacity": 10}]})
+check("水箱数不是 2 返回 422", s13d == 422, f"got {s13d}")
+
 print()
 if FAILED:
     print(f"共 {len(FAILED)} 项失败: {FAILED}")
